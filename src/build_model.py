@@ -13,15 +13,19 @@ WORKFLOW:
 5. Saves the combined historical + projected table to output/model_output.csv
 
 KEY SIMPLIFICATIONS (worth knowing so you can defend/improve them later):
-- No dividend/buyback data pulled yet -> 100% earnings retention assumed.
-  Equity only grows by net income. To improve: add a "PaymentsOfDividends"
-  tag to data_pull.py's TAG_MAP and subtract it from equity each year.
+- Dividends are projected as a flat historical average payout ratio
+  (dividends / net income, averaged over the last 3 years). Real payout
+  ratios move year to year with management decisions - this assumes they
+  hold steady, which is reasonable for a stable dividend payer like
+  PepsiCo but wouldn't hold for a company changing its capital policy.
+- No share buybacks modeled - PepsiCo also returns cash via buybacks,
+  which would further reduce the cash buildup below what this shows.
 - Long-term debt is held flat (no scheduled amortization) -> only the
   revolver (short_term_debt) flexes up or down to balance the model.
 - "Other assets" / "other liabilities" (anything not itemized by
   data_pull.py - e.g. goodwill, intangibles, accrued liabilities,
   deferred tax) are held constant in dollar terms at their base-year
-  level rather than modeled line-by-line. This is what keeps the
+  level rather than modeled line-by-line. This is part of what keeps the
   balance sheet balancing exactly (see balance_check column in the
   output - it should be ~0 for every projected year).
 """
@@ -36,6 +40,7 @@ PROJECTION_YEARS = 5
 LOOKBACK_YEARS = 3            # years of history used to derive assumptions
 MIN_CASH = 0                  # minimum operating cash before revolver draws
 DEFAULT_INTEREST_RATE = 0.04  # fallback only if debt columns are missing
+DEFAULT_PAYOUT_RATIO = 0.75   # fallback only if dividends column is missing
 CONVERGENCE_TOLERANCE = 1.0   # USD - circularity solve stops within $1
 MAX_ITERATIONS = 50
 
@@ -74,6 +79,15 @@ def compute_drivers(hist: pd.DataFrame, lookback: int = LOOKBACK_YEARS) -> dict:
               f"using a flat {DEFAULT_INTEREST_RATE:.1%} interest rate assumption. "
               "Add debt tags to data_pull.py's TAG_MAP for a real debt schedule.")
         d["interest_rate"] = None
+
+    has_dividend_data = "dividends" in hist.columns
+    if has_dividend_data:
+        d["payout_ratio"] = (recent["dividends"] / recent["net_income"]).mean()
+    else:
+        print("WARNING: no dividends column found - using a flat "
+              f"{DEFAULT_PAYOUT_RATIO:.0%} payout ratio assumption. Add a dividends "
+              "tag to data_pull.py's TAG_MAP for a real historical payout ratio.")
+        d["payout_ratio"] = DEFAULT_PAYOUT_RATIO
 
     # "Other" balance sheet items held flat in dollar terms (see docstring)
     d["other_assets_base"] = (last["total_assets"] - last["cash"] - last["receivables"]
@@ -117,13 +131,15 @@ def project_year(prior: dict, drivers: dict) -> dict:
         pretax_income = operating_income - interest_expense
         tax_expense = pretax_income * drivers["tax_rate"]
         net_income = pretax_income - tax_expense
+        dividends = net_income * drivers["payout_ratio"]
 
         delta_nwc = ((receivables - prior["receivables"])
                      + (inventory - prior["inventory"])
                      - (payables - prior["payables"]))
         cfo = net_income + da - delta_nwc
         cfi = -capex
-        cash_before_revolver = prior["cash"] + cfo + cfi
+        cff_ex_revolver = -dividends
+        cash_before_revolver = prior["cash"] + cfo + cfi + cff_ex_revolver
 
         if cash_before_revolver < MIN_CASH:
             revolver_draw = MIN_CASH - cash_before_revolver
@@ -150,7 +166,8 @@ def project_year(prior: dict, drivers: dict) -> dict:
     pretax_income = operating_income - interest_expense
     tax_expense = pretax_income * drivers["tax_rate"]
     net_income = pretax_income - tax_expense
-    total_equity = prior["total_equity"] + net_income  # 100% retention (simplification)
+    dividends = net_income * drivers["payout_ratio"]
+    total_equity = prior["total_equity"] + net_income - dividends  # retained earnings only
 
     total_assets = cash + receivables + inventory + ppe_net + other_assets
     total_liabilities = payables + long_term_debt + short_term_debt + other_liab
@@ -159,7 +176,7 @@ def project_year(prior: dict, drivers: dict) -> dict:
     return {
         "revenue": revenue, "cogs": cogs, "sga": sga, "operating_income": operating_income,
         "interest_expense": interest_expense, "pretax_income": pretax_income,
-        "tax_expense": tax_expense, "net_income": net_income,
+        "tax_expense": tax_expense, "net_income": net_income, "dividends": dividends,
         "cash": cash, "receivables": receivables, "inventory": inventory,
         "payables": payables, "ppe_net": ppe_net, "capex": capex, "da": da,
         "long_term_debt": long_term_debt, "short_term_debt": short_term_debt,
