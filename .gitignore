@@ -1,2 +1,3 @@
 data/raw_companyfacts.json
 .DS_Store
+__pycache__/
